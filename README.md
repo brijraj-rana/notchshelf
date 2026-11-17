@@ -41,6 +41,16 @@ Moving a file between two apps usually means lining up two windows first. Notchs
 
 ## Install
 
+### Download
+
+Get `Notchshelf-x.y.z.dmg` from the [latest release](https://github.com/BRIJRAJ-02/notchshelf/releases/latest), open it and drag Notchshelf to Applications. It runs on Apple Silicon and Intel, macOS 14 or later.
+
+The app is not notarized, so macOS blocks the first launch. Either allow it under System Settings → Privacy & Security → Open Anyway, or run:
+
+```bash
+xattr -dr com.apple.quarantine /Applications/Notchshelf.app
+```
+
 ### Build from source
 
 Requires Xcode 16 or later (for the Swift toolchain).

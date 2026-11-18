@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/BRIJRAJ-02/notchshelf/actions/workflows/ci.yml"><img src="https://github.com/BRIJRAJ-02/notchshelf/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/brijraj-rana/notchshelf/actions/workflows/ci.yml"><img src="https://github.com/brijraj-rana/notchshelf/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/macOS-14%2B-black" alt="macOS 14+">
   <img src="https://img.shields.io/badge/SwiftUI-native-black" alt="SwiftUI">
   <img src="https://img.shields.io/badge/license-MIT-black" alt="MIT">
@@ -53,7 +53,7 @@ Moving a file between two apps usually means lining up two windows first. Notchs
 
 ### Download
 
-Get `Notchshelf-x.y.z.dmg` from the [latest release](https://github.com/BRIJRAJ-02/notchshelf/releases/latest), open it and drag Notchshelf to Applications. It runs on Apple Silicon and Intel, macOS 14 or later.
+Get `Notchshelf-x.y.z.dmg` from the [latest release](https://github.com/brijraj-rana/notchshelf/releases/latest), open it and drag Notchshelf to Applications. It runs on Apple Silicon and Intel, macOS 14 or later.
 
 The app is not notarized, so macOS blocks the first launch. Either allow it under System Settings → Privacy & Security → Open Anyway, or run:
 
@@ -66,7 +66,7 @@ xattr -dr com.apple.quarantine /Applications/Notchshelf.app
 Requires Xcode 16 or later (for the Swift toolchain).
 
 ```bash
-git clone https://github.com/BRIJRAJ-02/notchshelf.git
+git clone https://github.com/brijraj-rana/notchshelf.git
 cd notchshelf
 ./scripts/build-app.sh --install   # builds, copies Notchshelf.app to /Applications, launches it
 ```
@@ -131,7 +131,7 @@ While the shelf is open and the pointer is on it, or while it was opened from th
 
 ### With Notchload
 
-[Notchload](https://github.com/BRIJRAJ-02/notchload) uses the strip under the notch, so the two share it. With Notchload running, the notch itself still opens Notchload and the count beside it opens the shelf. While the shelf is open or a file is in the air, Notchshelf tells Notchload to stay closed.
+[Notchload](https://github.com/brijraj-rana/notchload) uses the strip under the notch, so the two share it. With Notchload running, the notch itself still opens Notchload and the count beside it opens the shelf. While the shelf is open or a file is in the air, Notchshelf tells Notchload to stay closed.
 
 ## Design notes
 

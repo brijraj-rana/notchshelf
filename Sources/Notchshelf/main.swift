@@ -50,9 +50,11 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
 
     private let dragPasteboard = NSPasteboard(name: .drag)
     private var dragChangeCount = 0
-    var incomingDrag = false                 // someone is dragging files around the screen
+    var incomingDrag = false                 // someone is dragging files, text, a link or an image around the screen
     var draggingOut = false                  // the drag in progress started on the shelf
     private var draggedIDs: Set<UUID> = []
+    private var dragMustCopy = false
+    private var sharePicker: NSSharingServicePicker?
     private let promiseQueue = OperationQueue()
 
     // Keyboard. See Keyboard.swift.
@@ -77,7 +79,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         self.store = store
         super.init()
         actions.remove = { [weak self] id in self?.store.remove([id]) }
-        actions.clear = { [weak self] in self?.store.clear() }
+        actions.clear = { [weak self] everything in self?.clear(everything: everything) }
         actions.open = { [weak self] id in self?.openItem(id) }
         actions.hover = { [weak self] id, inside in self?.hover(id, inside) }
         actions.beginDrag = { [weak self] ids, view, event in self?.beginDrag(ids, from: view, event: event) }
@@ -226,7 +228,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
             // A drag session writes to the drag pasteboard as it starts; a plain click-and-move does not.
             if !incomingDrag, !draggingOut, dragPasteboard.changeCount != dragChangeCount {
                 dragChangeCount = dragPasteboard.changeCount
-                if carriesFiles(dragPasteboard) {
+                if carriesSomething(dragPasteboard) {
                     incomingDrag = true
                     apply()
                 }
@@ -242,7 +244,8 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         pointerMoved()
     }
 
-    private func carriesFiles(_ pasteboard: NSPasteboard) -> Bool {
+    /// Only the types are looked at. What is being dragged is not read until it is dropped on the shelf.
+    private func carriesSomething(_ pasteboard: NSPasteboard) -> Bool {
         pasteboard.availableType(from: DropView.acceptedTypes) != nil
     }
 
@@ -272,7 +275,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
             pointerInside = inside
             if !inside { keyYielded = false }
             // While the keyboard, Quick Look or the recorder holds the shelf, the pointer coming and going changes nothing.
-            if !pinned {
+            if !heldOpen {
                 // A short dwell before opening so passing by doesn't trigger it; none of that patience while carrying a file.
                 setOpen(inside, after: inside ? (incomingDrag ? 0.04 : 0.12) : 0.35)
             }
@@ -338,25 +341,57 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     }
 
     private func receive(_ info: NSDraggingInfo) -> Bool {
-        let pasteboard = info.draggingPasteboard
-        if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL], !urls.isEmpty {
-            store.add(urls)
-            return true
-        }
+        shelve(from: info.draggingPasteboard, acceptingPromises: true) != .nothing
+    }
 
-        // No file on disk yet: ask the source to write one into the shelf's own folder.
-        guard let receivers = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver],
-              !receivers.isEmpty else { return false }
-        let destination = store.makeDropDirectory()
-        for receiver in receivers {
-            receiver.receivePromisedFiles(atDestination: destination, options: [:], operationQueue: promiseQueue) { [weak self] url, error in
-                guard error == nil else { return }
-                DispatchQueue.main.async {
-                    MainActor.assumeIsolated { _ = self?.store.add([url], owned: true) }
+    enum Shelved {
+        case added          // something new is on the shelf
+        case alreadyHere    // files that were all parked already
+        case waiting        // promised files are on their way
+        case nothing
+    }
+
+    /// Shelves what a drag or the clipboard holds. Both come through here, so both behave the same.
+    func shelve(from pasteboard: NSPasteboard, acceptingPromises: Bool) -> Shelved {
+        let files = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        let receivers = acceptingPromises
+            ? pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver] ?? []
+            : []
+        let offer = Offer(fileCount: files.count, promiseCount: receivers.count,
+                          types: pasteboard.types?.map(\.rawValue) ?? [],
+                          url: pasteboard.string(forType: .URL),
+                          urlTitle: pasteboard.string(forType: DropView.urlName),
+                          text: pasteboard.string(forType: .string))
+
+        switch Intake.plan(for: offer) {
+        case .files:
+            return store.add(files) > 0 ? .added : .alreadyHere
+        case .promises:
+            // No file on disk yet: ask the source to write one into the shelf's own folder.
+            let destination = store.makeDropDirectory()
+            for receiver in receivers {
+                receiver.receivePromisedFiles(atDestination: destination, options: [:], operationQueue: promiseQueue) { [weak self] url, error in
+                    guard error == nil else { return }
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated { _ = self?.store.add([url], owned: true) }
+                    }
                 }
             }
+            return .waiting
+        case .image(let choice, let source):
+            guard var data = pasteboard.data(forType: NSPasteboard.PasteboardType(choice.type)), !data.isEmpty else { return .nothing }
+            if choice.convert {
+                guard let png = NSBitmapImageRep(data: data)?.representation(using: .png, properties: [:]) else { return .nothing }
+                data = png
+            }
+            return store.add(.image(data, fileExtension: choice.fileExtension, name: source)) != nil ? .added : .nothing
+        case .link(let url, let title):
+            return store.add(.link(url, title: title)) != nil ? .added : .nothing
+        case .text(let text):
+            return store.add(.text(text)) != nil ? .added : .nothing
+        case nil:
+            return .nothing
         }
-        return true
     }
 
     // MARK: Dragging out
@@ -376,6 +411,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
 
         draggingOut = true
         draggedIDs = Set(items.map(\.id))
+        dragMustCopy = DragOut.mustCopy(items, keepAll: keepAfterDragOut)
         // From here the shelf follows the pointer again, and the app being dragged into gets its keys back.
         keyboardOpen = false
         state.selection = nil
@@ -388,15 +424,20 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
         // Finder decides between move and copy the way it would for any file; inside the shelf there is nowhere to drop.
-        context == .outsideApplication ? [.copy, .move, .link, .generic] : []
+        guard context == .outsideApplication else { return [] }
+        // A file the shelf wrote and is keeping can only be copied, or the drop would carry off the shelf's own copy.
+        return dragMustCopy ? [.copy] : [.copy, .move, .link, .generic]
     }
 
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
         draggingOut = false
-        if !operation.isEmpty, !keepAfterDragOut {
-            store.remove(draggedIDs)
+        if !operation.isEmpty {
+            // Option at the moment of the drop keeps a copy here, the way it makes Finder copy instead of move.
+            let dragged = store.items.filter { draggedIDs.contains($0.id) }
+            store.remove(DragOut.leaving(dragged, optionHeld: NSEvent.modifierFlags.contains(.option), keepAll: keepAfterDragOut))
         }
         draggedIDs = []
+        dragMustCopy = false
         // The file may have just been moved; pick up its new place.
         store.refresh()
         apply()
@@ -437,6 +478,35 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         (sender.representedObject as? UUID).map(copyItem)
     }
 
+    @objc private func menuCopyPath(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID, let item = item(id) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(item.url.path, forType: .string)
+    }
+
+    @objc private func menuShare(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID, let item = item(id), let root = panel.contentView else { return }
+        let picker = NSSharingServicePicker(items: [item.url])
+        sharePicker = picker
+        // Once the menu has finished closing. The picker hangs from the tile, or from the pointer if the tile is gone.
+        DispatchQueue.main.async { [weak self] in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                if let tile = Self.tile(for: id, in: root) {
+                    picker.show(relativeTo: tile.bounds, of: tile, preferredEdge: .minY)
+                } else {
+                    let point = root.convert(self.panel.mouseLocationOutsideOfEventStream, from: nil)
+                    picker.show(relativeTo: NSRect(x: point.x, y: point.y, width: 1, height: 1), of: root, preferredEdge: .minY)
+                }
+            }
+        }
+    }
+
+    @objc private func menuTogglePin(_ sender: NSMenuItem) {
+        guard let id = sender.representedObject as? UUID, let item = item(id) else { return }
+        store.setPinned(!item.pinned, for: [id])
+    }
+
     @objc private func menuRemove(_ sender: NSMenuItem) {
         guard let id = sender.representedObject as? UUID else { return }
         store.remove([id])
@@ -472,9 +542,16 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         open.target = self
         menu.addItem(open)
 
-        let clear = NSMenuItem(title: "Clear Shelf", action: count == 0 ? nil : #selector(clearShelf), keyEquivalent: "")
+        let kept = store.items.filter(\.pinned).count
+        let clear = NSMenuItem(title: "Clear Shelf", action: count > kept ? #selector(clearShelf) : nil, keyEquivalent: "")
         clear.target = self
         menu.addItem(clear)
+        if kept > 0 {
+            // Clear Shelf passes kept items by, so taking those too is its own, separate choice.
+            let all = NSMenuItem(title: "Clear Kept Items Too", action: #selector(clearEverything), keyEquivalent: "")
+            all.target = self
+            menu.addItem(all)
+        }
         menu.addItem(.separator())
 
         let change = NSMenuItem(title: shortcut == nil ? "Set Shortcut…" : "Change Shortcut…", action: #selector(changeShortcut), keyEquivalent: "")
@@ -505,23 +582,26 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
 
     private func itemMenu(for id: UUID) -> NSMenu {
         let menu = NSMenu()
-        let entries: [(String, Selector)] = [
-            ("Quick Look", #selector(menuQuickLook(_:))),
-            ("Open", #selector(menuOpenItem(_:))),
-            ("Show in Finder", #selector(menuReveal(_:))),
-            ("Copy", #selector(menuCopy(_:))),
+        let groups: [[(String, Selector)]] = [
+            [("Quick Look", #selector(menuQuickLook(_:))),
+             ("Open", #selector(menuOpenItem(_:))),
+             ("Show in Finder", #selector(menuReveal(_:)))],
+            [("Copy", #selector(menuCopy(_:))),
+             ("Copy Path", #selector(menuCopyPath(_:))),
+             ("Share…", #selector(menuShare(_:)))],
+            [("Keep on Shelf", #selector(menuTogglePin(_:))),
+             ("Remove from Shelf", #selector(menuRemove(_:)))],
         ]
-        for (title, action) in entries {
-            let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
-            entry.target = self
-            entry.representedObject = id
-            menu.addItem(entry)
+        for (index, group) in groups.enumerated() {
+            if index > 0 { menu.addItem(.separator()) }
+            for (title, action) in group {
+                let entry = NSMenuItem(title: title, action: action, keyEquivalent: "")
+                entry.target = self
+                entry.representedObject = id
+                if action == #selector(menuTogglePin(_:)) { entry.state = item(id)?.pinned == true ? .on : .off }
+                menu.addItem(entry)
+            }
         }
-        menu.addItem(.separator())
-        let remove = NSMenuItem(title: "Remove from Shelf", action: #selector(menuRemove(_:)), keyEquivalent: "")
-        remove.target = self
-        remove.representedObject = id
-        menu.addItem(remove)
         return menu
     }
 
@@ -578,7 +658,18 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     }
 
     @objc private func clearShelf() {
-        store.clear()
+        clear(everything: false)
+    }
+
+    @objc private func clearEverything() {
+        clear(everything: true)
+    }
+
+    /// Kept items stay unless everything was asked for, and the header says how many did.
+    private func clear(everything: Bool) {
+        store.clear(includingPinned: everything)
+        let kept = store.items.count
+        if kept > 0 { flash("\(kept) kept") }
     }
 
     @objc private func toggleKeep() {

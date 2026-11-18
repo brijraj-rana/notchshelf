@@ -72,7 +72,7 @@ final class KeyPanel: NSPanel {
 
 extension ShelfController {
     /// Held open by something other than the pointer being over it.
-    var pinned: Bool { keyboardOpen || previewing || recording }
+    var heldOpen: Bool { keyboardOpen || previewing || recording }
 
     /// The item a key acts on right now.
     var targetID: UUID? {
@@ -151,7 +151,7 @@ extension ShelfController {
         pending?.cancel()
         let work = DispatchWorkItem { [weak self] in
             MainActor.assumeIsolated {
-                guard let self, !self.pinned else { return }
+                guard let self, !self.heldOpen else { return }
                 self.isOpen = open
                 if !open {
                     self.state.selection = nil
@@ -166,9 +166,9 @@ extension ShelfController {
         DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
-    /// Once nothing pins the shelf open any more, it goes back to following the pointer.
+    /// Once nothing holds the shelf open any more, it goes back to following the pointer.
     func settle() {
-        guard !pinned, isOpen, !pointerInside else { return }
+        guard !heldOpen, isOpen, !pointerInside else { return }
         setOpen(false, after: 0.35)
     }
 
@@ -259,6 +259,15 @@ extension ShelfController {
             guard let target else { return }
             copyItem(target)
             flash("Copied")
+        case .paste:
+            switch shelve(from: .general, acceptingPromises: false) {
+            case .added:
+                if keyboardOpen { state.selection = store.items.first?.id }
+            case .alreadyHere:
+                flash("Already here")
+            case .waiting, .nothing:
+                flash("Nothing to paste")
+            }
         case .remove:
             guard let target, let index else { return }
             let follow = keyboardOpen || state.selection == target
@@ -281,7 +290,7 @@ extension ShelfController {
         }
     }
 
-    private func flash(_ notice: String) {
+    func flash(_ notice: String) {
         noticeTimer?.cancel()
         state.notice = notice
         let work = DispatchWorkItem { [weak self] in
@@ -442,7 +451,7 @@ extension ShelfController {
         return NSRect(x: box.midX - fitted.width / 2, y: box.midY - fitted.height / 2, width: fitted.width, height: fitted.height)
     }
 
-    private static func tile(for id: UUID, in view: NSView) -> InteractionNSView? {
+    static func tile(for id: UUID, in view: NSView) -> InteractionNSView? {
         if let tile = view as? InteractionNSView, tile.ids == [id] { return tile }
         for child in view.subviews {
             if let found = tile(for: id, in: child) { return found }

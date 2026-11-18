@@ -82,7 +82,7 @@ struct RecorderState: Equatable {
 @MainActor
 final class ShelfActions {
     var remove: (UUID) -> Void = { _ in }
-    var clear: () -> Void = {}
+    var clear: (Bool) -> Void = { _ in }       // true takes kept items too
     var open: (UUID) -> Void = { _ in }
     var hover: (UUID, Bool) -> Void = { _, _ in }
     var beginDrag: ([UUID], NSView, NSEvent) -> Void = { _, _, _ in }
@@ -233,6 +233,11 @@ struct LipView: View {
 
 // MARK: Shelf
 
+extension ShelfItem {
+    /// Text that was dragged or pasted in, as opposed to a text file of the user's own.
+    var isSnippet: Bool { owned && url.pathExtension.lowercased() == "txt" }
+}
+
 struct TileView: View {
     let item: ShelfItem
     var selected = false
@@ -288,11 +293,23 @@ struct TileView: View {
                 .accessibilityLabel("Remove \(item.name) from the shelf")
             }
         }
+        .overlay(alignment: .topLeading) {
+            if item.pinned {
+                Image(systemName: "pin.fill")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(.white.opacity(0.8))
+                    .frame(width: 14, height: 14)
+                    .background(Circle().fill(Color(white: 0.2)))
+                    .padding(4)
+                    .transition(.opacity)
+                    .accessibilityHidden(true)
+            }
+        }
         .task(id: item.url) {
-            if let thumbnail = await Thumbnailer.thumbnail(for: item.url) { image = thumbnail }
+            if let thumbnail = await Thumbnailer.thumbnail(for: item.url, snippet: item.isSnippet) { image = thumbnail }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(item.name)
+        .accessibilityLabel(item.pinned ? "\(item.name), kept on the shelf" : item.name)
         .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
@@ -368,7 +385,8 @@ struct ShelfView: View {
                 .accessibilityLabel("Drag all \(items.count) files")
             }
             if !items.isEmpty {
-                Button("Clear") { actions.clear() }
+                // Kept items stay. Option-click takes those too.
+                Button("Clear") { actions.clear(NSEvent.modifierFlags.contains(.option)) }
                     .buttonStyle(.plain)
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.55))
@@ -406,7 +424,7 @@ struct ShelfView: View {
             .strokeBorder(.white.opacity(targeted ? 0.6 : 0.22), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
             .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(targeted ? 0.08 : 0)))
             .overlay {
-                Text(targeted ? "Let go to park it here" : "Drag files here to park them")
+                Text(targeted ? "Let go to park it here" : "Drag or paste something here to park it")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(targeted ? 0.9 : 0.5))
             }

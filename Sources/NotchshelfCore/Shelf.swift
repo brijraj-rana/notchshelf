@@ -8,17 +8,32 @@ public struct ShelfItem: Identifiable, Codable, Equatable {
     /// Lets the shelf follow the file if it is renamed or moved while parked.
     public var bookmark: Data?
     public var addedAt: Date
-    /// True when the file arrived as a promise (a photo, a web image) and was written into the shelf's own folder.
+    /// True when the shelf wrote the file into its own folder: a promised photo or web image, or text,
+    /// a link or an image that arrived with no file behind it.
     public var owned: Bool
+    /// Kept on the shelf: dragging it out leaves it here, and Clear passes it by.
+    public var pinned: Bool
 
     public var name: String { url.lastPathComponent }
 
-    public init(id: UUID = UUID(), url: URL, bookmark: Data? = nil, addedAt: Date = Date(), owned: Bool = false) {
+    public init(id: UUID = UUID(), url: URL, bookmark: Data? = nil, addedAt: Date = Date(), owned: Bool = false, pinned: Bool = false) {
         self.id = id
         self.url = url
         self.bookmark = bookmark
         self.addedAt = addedAt
         self.owned = owned
+        self.pinned = pinned
+    }
+
+    // Written out so a shelf saved before `pinned` existed still loads.
+    public init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        url = try values.decode(URL.self, forKey: .url)
+        bookmark = try values.decodeIfPresent(Data.self, forKey: .bookmark)
+        addedAt = try values.decode(Date.self, forKey: .addedAt)
+        owned = try values.decodeIfPresent(Bool.self, forKey: .owned) ?? false
+        pinned = try values.decodeIfPresent(Bool.self, forKey: .pinned) ?? false
     }
 }
 
@@ -28,7 +43,7 @@ public final class ShelfStore: ObservableObject {
     public let directory: URL
     private let fm = FileManager.default
 
-    /// Where promised files are written. Only files in here are ever deleted by the shelf.
+    /// Where the shelf writes its own files. Only files in here are ever deleted by the shelf.
     public var dropsDirectory: URL { directory.appendingPathComponent("Drops", isDirectory: true) }
     private var indexURL: URL { directory.appendingPathComponent("shelf.json") }
 
@@ -69,8 +84,34 @@ public final class ShelfStore: ObservableObject {
         save()
     }
 
-    public func clear() {
-        remove(Set(items.map(\.id)))
+    /// Empties the shelf, leaving pinned items unless told to take those too.
+    public func clear(includingPinned: Bool = false) {
+        remove(Set(items.filter { includingPinned || !$0.pinned }.map(\.id)))
+    }
+
+    public func setPinned(_ pinned: Bool, for ids: Set<UUID>) {
+        var changed = false
+        for index in items.indices where ids.contains(items[index].id) && items[index].pinned != pinned {
+            items[index].pinned = pinned
+            changed = true
+        }
+        if changed { save() }
+    }
+
+    /// Writes text, a link or an image into the shelf's own folder and parks the file. Nil if it could not be written.
+    @discardableResult
+    public func add(_ clipping: Clipping) -> ShelfItem? {
+        guard let data = clipping.contents else { return nil }
+        let folder = makeDropDirectory()
+        let url = folder.appendingPathComponent(clipping.fileName)
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            try? fm.removeItem(at: folder)
+            return nil
+        }
+        guard add([url], owned: true) == 1 else { return nil }
+        return items.first
     }
 
     /// Follows files that moved and drops the ones that were deleted or trashed.
@@ -93,7 +134,7 @@ public final class ShelfStore: ObservableObject {
         save()
     }
 
-    /// A fresh folder for one drop of promised files, so names from different drops cannot collide.
+    /// A fresh folder for one drop, so names from different drops cannot collide.
     public func makeDropDirectory() -> URL {
         let url = dropsDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try? fm.createDirectory(at: url, withIntermediateDirectories: true)
@@ -121,7 +162,7 @@ public final class ShelfStore: ObservableObject {
         return fm.fileExists(atPath: item.url.path) && !Self.isTrashed(item.url) ? item.url : nil
     }
 
-    /// Deletes the shelf's own copy of a promised file. Files the user parked from elsewhere are never touched.
+    /// Deletes a file the shelf wrote itself. Files the user parked from elsewhere are never touched.
     private func discard(_ item: ShelfItem) {
         guard item.owned else { return }
         let drops = Self.key(dropsDirectory) + "/"

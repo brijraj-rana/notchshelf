@@ -15,7 +15,16 @@ enum Snapshot {
         let store = ShelfStore(directory: work.appendingPathComponent("store"))
         store.add(files.reversed())
         Thumbnailer.scale = max(2, scale)
+
+        // Things that arrived without a file, and one item kept on the shelf.
+        let mixed = ShelfStore(directory: work.appendingPathComponent("mixed"))
+        mixed.add([files[1], files[0]])
+        if let image = pastedImage() { mixed.add(.image(image, fileExtension: "png", name: nil)) }
+        if let link = URL(string: "https://example.com/pricing") { mixed.add(.link(link, title: "Pricing and plans")) }
+        mixed.add(.text("Ship the build on Friday, after the release notes are checked once more."))
+        mixed.setPinned(true, for: Set(mixed.items.filter { $0.name == "cover-art.png" }.map(\.id)))
         preloadThumbnails(for: files)
+        preloadThumbnails(for: mixed.items.map(\.url), snippets: Set(mixed.items.filter(\.isSnippet).map(\.url)))
 
         let empty = ShelfStore(directory: work.appendingPathComponent("empty"))
         let shortcut = Shortcut.standard.parts
@@ -27,6 +36,9 @@ enum Snapshot {
             // Opened from the keyboard: the second tile selected, and the word that follows Command-C.
             Shot(name: "selected", mode: .open, store: store, selection: 1),
             Shot(name: "copied", mode: .open, store: store, selection: 1, notice: "Copied"),
+            // Text, a link and a pasted image beside two files, one of them kept.
+            Shot(name: "clippings", mode: .open, store: mixed),
+            Shot(name: "kept", mode: .open, store: mixed, notice: "1 kept"),
             Shot(name: "shortcut", mode: .recording, store: store, recorder: RecorderState(keys: shortcut)),
             Shot(name: "shortcut-holding", mode: .recording, store: store, recorder: RecorderState(keys: shortcut, held: ["⌃", "⇧"])),
             Shot(name: "shortcut-rejected", mode: .recording, store: store,
@@ -80,11 +92,11 @@ enum Snapshot {
     }
 
     /// ImageRenderer draws once and does not run view tasks, so thumbnails have to be in the cache beforehand.
-    private static func preloadThumbnails(for files: [URL]) {
+    private static func preloadThumbnails(for files: [URL], snippets: Set<URL> = []) {
         var remaining = files.count
         for url in files {
             Task {
-                _ = await Thumbnailer.thumbnail(for: url.standardizedFileURL)
+                _ = await Thumbnailer.thumbnail(for: url.standardizedFileURL, snippet: snippets.contains(url))
                 remaining -= 1
             }
         }
@@ -120,6 +132,13 @@ enum Snapshot {
     }
 
     private typealias RGB = (CGFloat, CGFloat, CGFloat)
+
+    private static func pastedImage() -> Data? {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("notchshelf-pasted-\(UUID().uuidString).png")
+        defer { try? FileManager.default.removeItem(at: url) }
+        writeImage(to: url, type: .png, top: (0.42, 0.78, 0.6), bottom: (0.12, 0.42, 0.44))
+        return try? Data(contentsOf: url)
+    }
 
     private static func writeImage(to url: URL, type: NSBitmapImageRep.FileType, top: RGB, bottom: RGB) {
         let width = 960, height = 720

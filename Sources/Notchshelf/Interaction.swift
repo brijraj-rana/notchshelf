@@ -1,4 +1,5 @@
 import AppKit
+import NotchshelfCore
 import QuickLookThumbnailing
 import SwiftUI
 
@@ -85,14 +86,19 @@ final class InteractionNSView: NSView {
 
 /// Wraps the SwiftUI content and receives drops. AppKit is used here because file promises
 /// (photos, images dragged out of a browser) are not reachable through SwiftUI's onDrop.
+/// Text, links and bare images come in the same way and are written out as files by the store.
 final class DropView: NSView {
     var allows: () -> Bool = { false }
     var onTargeted: (Bool) -> Void = { _ in }
     var onDrop: (NSDraggingInfo) -> Bool = { _ in false }
     var onMove: () -> Void = {}
 
+    /// The title a browser sends along with a link.
+    static let urlName = NSPasteboard.PasteboardType("public.url-name")
+
     static let acceptedTypes: [NSPasteboard.PasteboardType] =
         [.fileURL] + NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) }
+        + [.URL, .string] + ImageChoice.types.map { NSPasteboard.PasteboardType($0) }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -142,12 +148,40 @@ enum Thumbnailer {
     }
 
     /// A Quick Look preview of the file's contents, or nil for things that only have an icon (folders, apps).
-    static func thumbnail(for url: URL) async -> NSImage? {
+    static func thumbnail(for url: URL, snippet: Bool = false) async -> NSImage? {
         if let hit = cache[url] { return hit }
+        if snippet, let image = page(for: url) {
+            cache[url] = image
+            return image
+        }
         let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: 62, height: 54), scale: scale, representationTypes: .thumbnail)
         guard let representation = try? await QLThumbnailGenerator.shared.generateBestRepresentation(for: request) else { return nil }
         let image = representation.nsImage
         cache[url] = image
         return image
+    }
+
+    /// Quick Look draws a text file as a whole page, which leaves a few shelved words too small to read.
+    /// This is the same white page with only the opening lines on it, at a size that can be read on a tile.
+    private static func page(for url: URL) -> NSImage? {
+        guard let data = try? Data(contentsOf: url, options: .mappedIfSafe) else { return nil }
+        let opening = String(decoding: data.prefix(600), as: UTF8.self)
+        let lines = opening.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard !lines.isEmpty else { return nil }
+
+        let paragraph = NSMutableParagraphStyle()
+        paragraph.lineBreakMode = .byWordWrapping
+        paragraph.paragraphSpacing = 2
+        let text = NSAttributedString(string: lines.joined(separator: "\n"), attributes: [
+            .font: NSFont.systemFont(ofSize: 7.5, weight: .medium),
+            .foregroundColor: NSColor(white: 0.16, alpha: 1),
+            .paragraphStyle: paragraph,
+        ])
+        return NSImage(size: NSSize(width: 54, height: 54), flipped: true) { rect in
+            NSColor.white.setFill()
+            rect.fill()
+            text.draw(with: rect.insetBy(dx: 5, dy: 5), options: [.usesLineFragmentOrigin, .truncatesLastVisibleLine])
+            return true
+        }
     }
 }

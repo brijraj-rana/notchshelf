@@ -249,6 +249,8 @@ public enum ShelfCommand: Equatable, Sendable {
     case move(Int, held: Bool)
     case open
     case copy
+    /// Shelve whatever is on the clipboard.
+    case paste
     case remove
     case close
 }
@@ -287,6 +289,9 @@ public enum ShelfKeys {
 
         if plain, key.keyCode == KeyCode.escape { return .close }
         if plain, let arrow { return context.count > 0 ? .move(arrow, held: key.isRepeat) : nil }
+
+        // Pasting needs nothing on the shelf, so it works on an empty one too.
+        if key.modifiers == .command, key.character == "v" { return key.isRepeat ? nil : .paste }
 
         // Everything else acts on one item, and only on a deliberate press.
         guard context.hasTarget, !key.isRepeat else { return nil }

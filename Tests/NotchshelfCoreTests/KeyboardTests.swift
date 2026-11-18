@@ -258,4 +258,20 @@ final class ShelfKeysTests: XCTestCase {
         let single = ShelfKeys.Context(isOpen: true, previewing: true, hasTarget: true, count: 1)
         XCTAssertNil(ShelfKeys.command(for: key(KeyCode.right), in: single))
     }
+
+    func testCommandVPastesEvenOnAnEmptyShelf() {
+        let paste = KeyStroke(keyCode: 9, modifiers: .command, character: "v")
+        XCTAssertEqual(ShelfKeys.command(for: paste, in: .init(isOpen: true)), .paste)
+        XCTAssertEqual(ShelfKeys.command(for: paste, in: .init(isOpen: true, hasTarget: true, count: 3)), .paste)
+        XCTAssertNil(ShelfKeys.command(for: paste, in: .init(isOpen: false)))
+
+        // Not while Quick Look has the keys, not on a held key, and not with anything else held as well.
+        XCTAssertNil(ShelfKeys.command(for: paste, in: .init(isOpen: true, previewing: true, hasTarget: true, count: 3)))
+        var held = paste
+        held.isRepeat = true
+        XCTAssertNil(ShelfKeys.command(for: held, in: .init(isOpen: true)))
+        let shifted = KeyStroke(keyCode: 9, modifiers: [.command, .shift], character: "v")
+        XCTAssertNil(ShelfKeys.command(for: shifted, in: .init(isOpen: true)))
+        XCTAssertNil(ShelfKeys.command(for: KeyStroke(keyCode: 9, character: "v"), in: .init(isOpen: true)))
+    }
 }

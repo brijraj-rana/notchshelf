@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import NotchshelfCore
+import Quartz
 import ServiceManagement
 import SwiftUI
 
@@ -29,28 +30,43 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     let state = PanelState()
     let actions = ShelfActions()
 
-    private var panel: NotchPanel!
+    var panel: NotchPanel!
+    var keyPanel: KeyPanel!
+    let hotKey = HotKey()
     private var statusItem: NSStatusItem?
     private var subscriptions: Set<AnyCancellable> = []
 
     // Hit areas in screen coordinates.
     private var hoverRect = NSRect.zero      // opens the shelf while it is holding files
     private var dropZone = NSRect.zero       // opens the shelf while a file is being dragged
-    private var openRect = NSRect.zero       // keeps it open
+    var openRect = NSRect.zero               // keeps it open
 
-    private var pointerInside = false
-    private var isOpen = false
-    private var pending: DispatchWorkItem?
+    var pointerInside = false
+    var isOpen = false
+    var pending: DispatchWorkItem?
     private var pollTimer: Timer?
-    private var menuOpen = false
+    var menuOpen = false
     private var announcedCovering = false
 
     private let dragPasteboard = NSPasteboard(name: .drag)
     private var dragChangeCount = 0
-    private var incomingDrag = false         // someone is dragging files around the screen
-    private var draggingOut = false          // the drag in progress started on the shelf
+    var incomingDrag = false                 // someone is dragging files around the screen
+    var draggingOut = false                  // the drag in progress started on the shelf
     private var draggedIDs: Set<UUID> = []
     private let promiseQueue = OperationQueue()
+
+    // Keyboard. See Keyboard.swift.
+    var keyboardOpen = false                 // opened with the shortcut: stays open until told otherwise
+    var previewing = false                   // Quick Look is showing
+    var recording = false                    // waiting for a new shortcut
+    var hasKeyFocus = false
+    var keyYielded = false                   // focus was taken away; leave it alone until the pointer comes back
+    var hoveredID: UUID?
+    var previousApp: NSRunningApplication?   // who to hand the front back to after Quick Look
+    var previewStart = 0
+    var previewIndex: NSKeyValueObservation?
+    var previewClose: NSObjectProtocol?
+    var noticeTimer: DispatchWorkItem?
 
     private var keepAfterDragOut: Bool {
         get { UserDefaults.standard.bool(forKey: "keepAfterDragOut") }
@@ -63,6 +79,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         actions.remove = { [weak self] id in self?.store.remove([id]) }
         actions.clear = { [weak self] in self?.store.clear() }
         actions.open = { [weak self] id in self?.openItem(id) }
+        actions.hover = { [weak self] id, inside in self?.hover(id, inside) }
         actions.beginDrag = { [weak self] ids, view, event in self?.beginDrag(ids, from: view, event: event) }
     }
 
@@ -96,11 +113,15 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         host.autoresizingMask = [.width, .height]
         drop.addSubview(host)
         panel.contentView = drop
+        keyPanel = makeKeyPanel()
 
         layout()
         apply()
         panel.orderFrontRegardless()
         installStatusItem()
+
+        hotKey.onPress = { [weak self] in self?.toggleFromShortcut() }
+        hotKey.register(shortcutSetting.shortcut)
 
         // Published values arrive before they are stored, so read them on the next turn.
         store.$items
@@ -108,6 +129,12 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
             .removeDuplicates()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in self?.apply() }
+            .store(in: &subscriptions)
+        store.$items
+            .map { $0.map(\.id) }
+            .removeDuplicates()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.previewItemsChanged() }
             .store(in: &subscriptions)
 
         NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
@@ -127,6 +154,10 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
             MainActor.assumeIsolated { self?.handle(event) }
             return event
         }
+        NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .flagsChanged]) { [weak self] event in
+            let used = MainActor.assumeIsolated { self?.handleKey(event) ?? false }
+            return used ? nil : event
+        }
         NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
             // Right-clicks elsewhere in the app (the menu bar icon) are not ours to handle.
             let onPanel = MainActor.assumeIsolated { self?.panel != nil && event.window === self?.panel }
@@ -137,6 +168,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     }
 
     func stop() {
+        hotKey.unregister()
         if announcedCovering { Presence.post(Presence.clear) }
     }
 
@@ -162,6 +194,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         let size = geo.windowSize
         let midX = screen.frame.midX
         panel.setFrame(NSRect(x: midX - size.width / 2, y: top - size.height, width: size.width, height: size.height), display: true)
+        keyPanel.setFrame(NSRect(x: midX, y: top - 1, width: 1, height: 1), display: false)
 
         let nw = geo.notchWidth, nh = geo.notchHeight
         if geo.hasNotch {
@@ -181,9 +214,14 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     // MARK: Pointer and drags
 
     private func handle(_ event: NSEvent) {
+        state.instant = false       // the pointer is driving again, so things may move
         switch event.type {
         case .leftMouseDown:
             dragChangeCount = dragPasteboard.changeCount
+            // A shelf opened from the keyboard has no pointer to follow away, so a click anywhere else closes it.
+            if keyboardOpen, !previewing, !openRect.contains(NSEvent.mouseLocation) {
+                closeShelf(instant: false)
+            }
         case .leftMouseDragged:
             // A drag session writes to the drag pasteboard as it starts; a plain click-and-move does not.
             if !incomingDrag, !draggingOut, dragPasteboard.changeCount != dragChangeCount {
@@ -216,7 +254,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         pointerMoved()
     }
 
-    private func pointerMoved() {
+    func pointerMoved() {
         guard !menuOpen, panel != nil else { return }
         let point = NSEvent.mouseLocation
         let inside: Bool
@@ -230,26 +268,24 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
 
         // Outside the visible shape the window must not swallow clicks or drops meant for whatever is underneath.
         panel.ignoresMouseEvents = !inside
-        guard inside != pointerInside else { return }
-        pointerInside = inside
-
-        pending?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            MainActor.assumeIsolated {
-                self?.isOpen = inside
-                self?.apply()
+        if inside != pointerInside {
+            pointerInside = inside
+            if !inside { keyYielded = false }
+            // While the keyboard, Quick Look or the recorder holds the shelf, the pointer coming and going changes nothing.
+            if !pinned {
+                // A short dwell before opening so passing by doesn't trigger it; none of that patience while carrying a file.
+                setOpen(inside, after: inside ? (incomingDrag ? 0.04 : 0.12) : 0.35)
             }
         }
-        pending = work
-        // A short dwell before opening so passing by doesn't trigger it; none of that patience while carrying a file.
-        let delay = inside ? (incomingDrag ? 0.04 : 0.12) : 0.35
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        updateKeyFocus()
     }
 
     /// Settles the visible mode from what is known right now.
-    private func apply() {
+    func apply() {
         let mode: Mode
-        if isOpen {
+        if recording {
+            mode = .recording
+        } else if isOpen {
             mode = .open
         } else if incomingDrag {
             mode = .hint
@@ -262,7 +298,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
             state.mode = mode
         }
 
-        let covering = mode == .open || mode == .hint
+        let covering = mode == .open || mode == .hint || mode == .recording
         if covering != announcedCovering {
             announcedCovering = covering
             Presence.post(covering ? Presence.covering : Presence.clear)
@@ -340,7 +376,11 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
 
         draggingOut = true
         draggedIDs = Set(items.map(\.id))
+        // From here the shelf follows the pointer again, and the app being dragged into gets its keys back.
+        keyboardOpen = false
+        state.selection = nil
         apply()
+        updateKeyFocus()
         let session = view.beginDraggingSession(with: dragItems, event: event, source: self)
         session.animatesToStartingPositionsOnCancelOrFail = true
         if dragItems.count > 1 { session.draggingFormation = .pile }
@@ -369,9 +409,19 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         store.items.first { $0.id == id }
     }
 
-    private func openItem(_ id: UUID) {
+    func openItem(_ id: UUID) {
         guard let item = item(id) else { return }
         NSWorkspace.shared.open(item.url)
+    }
+
+    func copyItem(_ id: UUID) {
+        guard let item = item(id) else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.writeObjects([item.url as NSURL])
+    }
+
+    @objc private func menuQuickLook(_ sender: NSMenuItem) {
+        (sender.representedObject as? UUID).map(showPreview(of:))
     }
 
     @objc private func menuOpenItem(_ sender: NSMenuItem) {
@@ -384,9 +434,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {
-        guard let id = sender.representedObject as? UUID, let item = item(id) else { return }
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.writeObjects([item.url as NSURL])
+        (sender.representedObject as? UUID).map(copyItem)
     }
 
     @objc private func menuRemove(_ sender: NSMenuItem) {
@@ -418,9 +466,25 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         summary.isEnabled = false
         menu.addItem(summary)
 
+        let shortcut = shortcutSetting.shortcut
+        let open = NSMenuItem(title: "Open Shelf", action: #selector(openShelf), keyEquivalent: shortcut.flatMap(Self.keyEquivalent) ?? "")
+        open.keyEquivalentModifierMask = NSEvent.ModifierFlags(rawValue: shortcut?.modifiers.cocoaFlags ?? 0)
+        open.target = self
+        menu.addItem(open)
+
         let clear = NSMenuItem(title: "Clear Shelf", action: count == 0 ? nil : #selector(clearShelf), keyEquivalent: "")
         clear.target = self
         menu.addItem(clear)
+        menu.addItem(.separator())
+
+        let change = NSMenuItem(title: shortcut == nil ? "Set Shortcut…" : "Change Shortcut…", action: #selector(changeShortcut), keyEquivalent: "")
+        change.target = self
+        menu.addItem(change)
+        if shortcut != nil {
+            let off = NSMenuItem(title: "Turn Off Shortcut", action: #selector(turnOffShortcut), keyEquivalent: "")
+            off.target = self
+            menu.addItem(off)
+        }
         menu.addItem(.separator())
 
         let keep = NSMenuItem(title: "Keep Files After Dragging Out", action: #selector(toggleKeep), keyEquivalent: "")
@@ -442,6 +506,7 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
     private func itemMenu(for id: UUID) -> NSMenu {
         let menu = NSMenu()
         let entries: [(String, Selector)] = [
+            ("Quick Look", #selector(menuQuickLook(_:))),
             ("Open", #selector(menuOpenItem(_:))),
             ("Show in Finder", #selector(menuReveal(_:))),
             ("Copy", #selector(menuCopy(_:))),
@@ -476,6 +541,40 @@ final class ShelfController: NSObject, NSDraggingSource, NSMenuDelegate {
         menu.popUp(positioning: nil, at: point, in: view)
         menuOpen = false
         pointerMoved()
+    }
+
+    /// What AppKit needs to draw a shortcut beside a menu item, or nil for a key it has no glyph for.
+    private static func keyEquivalent(for shortcut: Shortcut) -> String? {
+        func special(_ code: Int) -> String? { UnicodeScalar(code).map { String(Character($0)) } }
+        if let number = KeyCode.functionNumber(shortcut.keyCode) { return special(NSF1FunctionKey + number - 1) }
+        switch shortcut.keyCode {
+        case KeyCode.space: return " "
+        case KeyCode.returnKey: return "\r"
+        case KeyCode.tab: return "\t"
+        case KeyCode.delete: return "\u{8}"
+        case KeyCode.forwardDelete: return special(NSDeleteFunctionKey)
+        case KeyCode.left: return special(NSLeftArrowFunctionKey)
+        case KeyCode.right: return special(NSRightArrowFunctionKey)
+        case KeyCode.up: return special(NSUpArrowFunctionKey)
+        case KeyCode.down: return special(NSDownArrowFunctionKey)
+        default:
+            let name = shortcut.keyName
+            return name.count == 1 ? name.lowercased() : nil
+        }
+    }
+
+    @objc private func openShelf() {
+        guard !recording, !previewing, !keyboardOpen else { return }
+        openFromKeyboard(instant: false)
+    }
+
+    @objc private func changeShortcut() {
+        beginRecording()
+    }
+
+    @objc private func turnOffShortcut() {
+        shortcutSetting = .off
+        hotKey.register(nil)
     }
 
     @objc private func clearShelf() {
@@ -541,6 +640,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         controller?.stop()
     }
+
+    // Quick Look asks the key window first and the app delegate last. Once its own panel has the keys
+    // this is the only place left for it to ask, so the shelf answers here as well as on the key panel.
+    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool { controller != nil }
+    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) { controller?.previewBegan(panel) }
+    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) { controller?.previewControlEnded(panel) }
 }
 
 MainActor.assumeIsolated {

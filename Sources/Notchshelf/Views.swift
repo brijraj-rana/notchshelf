@@ -8,6 +8,7 @@ enum Mode: Equatable {
     case ear        // holding files: a small count beside the notch
     case hint       // a file is being dragged somewhere on screen: a lip drops out as the target
     case open       // the shelf itself
+    case recording  // waiting for a new keyboard shortcut
 }
 
 struct NotchGeometry: Equatable {
@@ -17,6 +18,8 @@ struct NotchGeometry: Equatable {
     var lipHeight: CGFloat = 26
     var openWidth: CGFloat = 440
     var openHeight: CGFloat = 138
+    var recordWidth: CGFloat = 280
+    var recordHeight: CGFloat = 92
     var margin: CGFloat = 40               // room for the shadow
 
     var hasNotch: Bool { notchHeight > 0 }
@@ -45,6 +48,8 @@ struct NotchGeometry: Equatable {
             return Dims(ear: hasNotch && hasItems ? earWidth : 0, width: notchWidth, height: lipHeight, radius: 10)
         case .open:
             return Dims(ear: 0, width: openWidth, height: openHeight, radius: 18)
+        case .recording:
+            return Dims(ear: 0, width: recordWidth, height: recordHeight, radius: 18)
         }
     }
 }
@@ -53,6 +58,24 @@ final class PanelState: ObservableObject {
     @Published var mode: Mode = .hidden
     @Published var geo = NotchGeometry()
     @Published var targeted = false        // a drag is hovering over the shelf right now
+    @Published var selection: UUID?        // the tile the keyboard acts on
+    @Published var notice: String?         // a word in the header after an action with nothing else to show for it
+    @Published var recorder = RecorderState()
+    /// Set while a change comes from a key press, which should land at once instead of springing.
+    var instant = false
+}
+
+/// What the shortcut recorder is showing.
+struct RecorderState: Equatable {
+    enum Phase: Equatable {
+        case waiting
+        case rejected(String)
+        case saved
+    }
+
+    var keys: [String] = []                // the shortcut in use, or the one just recorded
+    var held: [String] = []                // modifiers being held down right now
+    var phase: Phase = .waiting
 }
 
 /// What the views can ask the controller to do.
@@ -61,6 +84,7 @@ final class ShelfActions {
     var remove: (UUID) -> Void = { _ in }
     var clear: () -> Void = {}
     var open: (UUID) -> Void = { _ in }
+    var hover: (UUID, Bool) -> Void = { _, _ in }
     var beginDrag: ([UUID], NSView, NSEvent) -> Void = { _, _, _ in }
 }
 
@@ -74,6 +98,11 @@ extension EnvironmentValues {
         get { self[SnapshotKey.self] }
         set { self[SnapshotKey.self] = newValue }
     }
+}
+
+enum Motion {
+    /// For small things that follow the hand: the selection moving, a tile being pressed.
+    static let quick: Animation = .timingCurve(0.22, 1, 0.36, 1, duration: 0.15)
 }
 
 // MARK: Shape
@@ -206,10 +235,13 @@ struct LipView: View {
 
 struct TileView: View {
     let item: ShelfItem
+    var selected = false
     let actions: ShelfActions
     @State private var image: NSImage?
     @State private var hovering = false
+    @State private var pressed = false
     @Environment(\.isSnapshot) private var isSnapshot
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(spacing: 5) {
@@ -219,19 +251,25 @@ struct TileView: View {
                 .aspectRatio(contentMode: .fit)
                 .clipShape(RoundedRectangle(cornerRadius: 3))
                 .frame(width: 62, height: 54)
+                .scaleEffect(pressed && !reduceMotion ? 0.96 : 1)
+                .animation(Motion.quick, value: pressed)
             Text(item.name)
                 .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(.white.opacity(0.8))
+                .foregroundStyle(.white.opacity(selected ? 0.95 : 0.8))
                 .lineLimit(1)
                 .truncationMode(.middle)
         }
         .padding(.horizontal, 6)
         .padding(.vertical, 6)
         .frame(width: 80)
+        .id(item.id)
         .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(hovering ? 0.1 : 0)))
         .overlay {
             if !isSnapshot {
-                Interaction(ids: [item.id], actions: actions, onHover: { hovering = $0 }, onOpen: { actions.open(item.id) })
+                Interaction(ids: [item.id], actions: actions,
+                            onHover: { hovering = $0; actions.hover(item.id, $0) },
+                            onPress: { pressed = $0 },
+                            onOpen: { actions.open(item.id) })
             }
         }
         .overlay(alignment: .topTrailing) {
@@ -255,14 +293,21 @@ struct TileView: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(item.name)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 }
 
 struct ShelfView: View {
     let items: [ShelfItem]
     let targeted: Bool
+    var selection: UUID?
+    var notice: String?
     let actions: ShelfActions
     @Environment(\.isSnapshot) private var isSnapshot
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private let tileWidth: CGFloat = 80
+    private let tileSpacing: CGFloat = 4
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -272,7 +317,13 @@ struct ShelfView: View {
             } else if isSnapshot {
                 tiles.frame(maxWidth: .infinity, alignment: .leading)
             } else {
-                ScrollView(.horizontal, showsIndicators: false) { tiles }
+                ScrollViewReader { proxy in
+                    ScrollView(.horizontal, showsIndicators: false) { tiles }
+                        .onChange(of: selection) { _, id in
+                            // No animation: the selection only ever changes here on a key press.
+                            if let id { proxy.scrollTo(id) }
+                        }
+                }
             }
         }
         .padding(.horizontal, 14)
@@ -292,6 +343,13 @@ struct ShelfView: View {
                     .font(.system(size: 10.5, weight: .semibold, design: .rounded).monospacedDigit())
                     .foregroundStyle(.white.opacity(0.8))
                     .contentTransition(.numericText())
+            }
+            if let notice {
+                Text(notice)
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(.white.opacity(0.55))
+                    .padding(.leading, 4)
+                    .transition(.identity)
             }
             Spacer()
             if items.count > 1 {
@@ -323,10 +381,22 @@ struct ShelfView: View {
     }
 
     private var tiles: some View {
-        HStack(spacing: 4) {
+        HStack(spacing: tileSpacing) {
             ForEach(items) { item in
-                TileView(item: item, actions: actions)
+                TileView(item: item, selected: item.id == selection, actions: actions)
                     .transition(.scale(scale: 0.85).combined(with: .opacity))
+            }
+        }
+        .background(alignment: .leading) {
+            // One highlight that slides between tiles, instead of one per tile fading in and out.
+            if let index = items.firstIndex(where: { $0.id == selection }) {
+                RoundedRectangle(cornerRadius: 9)
+                    .fill(.white.opacity(0.16))
+                    .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.white.opacity(0.3), lineWidth: 1))
+                    .frame(width: tileWidth)
+                    .offset(x: CGFloat(index) * (tileWidth + tileSpacing))
+                    .animation(reduceMotion ? nil : Motion.quick, value: index)
+                    .transition(.identity)
             }
         }
     }
@@ -340,6 +410,80 @@ struct ShelfView: View {
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(targeted ? 0.9 : 0.5))
             }
+    }
+}
+
+// MARK: Shortcut recorder
+
+struct Keycap: View {
+    let label: String
+
+    var body: some View {
+        Text(label)
+            .font(.system(size: 12, weight: .semibold, design: .rounded))
+            .foregroundStyle(.white.opacity(0.9))
+            .padding(.horizontal, 7)
+            .frame(minWidth: 26)
+            .frame(height: 26)
+            .background(RoundedRectangle(cornerRadius: 7).fill(.white.opacity(0.1)))
+    }
+}
+
+/// Shown in place of the shelf while the app waits for a new shortcut.
+struct RecorderView: View {
+    let recorder: RecorderState
+
+    private var message: String {
+        switch recorder.phase {
+        case .waiting: return "Press the new shortcut"
+        case .rejected(let reason): return reason
+        case .saved: return "Shortcut set"
+        }
+    }
+
+    var body: some View {
+        let saved = recorder.phase == .saved
+        let holding = !recorder.held.isEmpty && !saved
+
+        VStack(spacing: 6) {
+            HStack(spacing: 6) {
+                Text("SHORTCUT")
+                    .font(.system(size: 9.5, weight: .semibold))
+                    .tracking(0.8)
+                    .foregroundStyle(.white.opacity(0.45))
+                Spacer()
+                if !saved {
+                    Text("Esc to cancel")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.white.opacity(0.55))
+                }
+            }
+            .frame(height: 20)
+
+            HStack(spacing: 4) {
+                ForEach(Array((holding ? recorder.held : recorder.keys).enumerated()), id: \.offset) { _, key in
+                    Keycap(label: key)
+                }
+                if holding || recorder.keys.isEmpty {
+                    // The key still to come.
+                    RoundedRectangle(cornerRadius: 7)
+                        .strokeBorder(.white.opacity(0.22), style: StrokeStyle(lineWidth: 1, dash: [4, 4]))
+                        .frame(width: 26, height: 26)
+                }
+            }
+            // The shortcut in use sits back until it is replaced.
+            .opacity(saved || holding ? 1 : 0.45)
+
+            Text(message)
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.white.opacity(recorder.phase == .waiting ? 0.5 : 0.9))
+        }
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .frame(maxHeight: .infinity, alignment: .top)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(saved ? "Shortcut set to \(recorder.keys.joined(separator: " "))" : "\(message). Escape cancels.")
     }
 }
 
@@ -359,13 +503,15 @@ struct RootView: View {
         let shape = ShelfShape(ear: d.ear, width: d.width, height: d.height, radius: d.radius,
                                notchWidth: g.notchWidth, notchHeight: g.notchHeight)
         let open = state.mode == .open
+        let recording = state.mode == .recording
         let lip = state.mode == .hint || (state.mode == .ear && !g.hasNotch)
-        let spring: Animation = reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.36, dampingFraction: 0.82)
+        let spring: Animation? = state.instant ? nil
+            : (reduceMotion ? .easeOut(duration: 0.15) : .spring(response: 0.36, dampingFraction: 0.82))
 
         ZStack(alignment: .top) {
             shape
                 .fill(.black)
-                .shadow(color: .black.opacity(open ? 0.4 : 0), radius: 14, y: 6)
+                .shadow(color: .black.opacity(open || recording ? 0.4 : 0), radius: 14, y: 6)
 
             ZStack(alignment: .top) {
                 if d.ear > 0 {
@@ -381,11 +527,18 @@ struct RootView: View {
                         .transition(.opacity)
                 }
                 // Always mounted, so a tile being dragged out keeps its view while the panel closes behind it.
-                ShelfView(items: store.items, targeted: state.targeted, actions: actions)
+                ShelfView(items: store.items, targeted: state.targeted, selection: state.selection, notice: state.notice, actions: actions)
                     .frame(width: g.openWidth, height: g.openHeight)
                     .padding(.top, g.notchHeight)
                     .opacity(open ? 1 : 0)
                     .allowsHitTesting(open)
+
+                if recording {
+                    RecorderView(recorder: state.recorder)
+                        .frame(width: g.recordWidth, height: g.recordHeight)
+                        .padding(.top, g.notchHeight)
+                        .transition(.opacity)
+                }
 
                 if state.targeted && open && count > 0 {
                     // Half of this stroke falls outside the mask, leaving a 1.5 point inner edge.

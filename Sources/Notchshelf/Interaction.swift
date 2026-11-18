@@ -10,6 +10,7 @@ struct Interaction: NSViewRepresentable {
     let ids: [UUID]
     let actions: ShelfActions
     var onHover: (Bool) -> Void = { _ in }
+    var onPress: (Bool) -> Void = { _ in }
     var onOpen: () -> Void = {}
 
     func makeNSView(context: Context) -> InteractionNSView {
@@ -20,6 +21,7 @@ struct Interaction: NSViewRepresentable {
         view.ids = ids
         view.actions = actions
         view.onHover = onHover
+        view.onPress = onPress
         view.onOpen = onOpen
     }
 }
@@ -28,6 +30,7 @@ final class InteractionNSView: NSView {
     var ids: [UUID] = []
     var actions: ShelfActions?
     var onHover: (Bool) -> Void = { _ in }
+    var onPress: (Bool) -> Void = { _ in }
     var onOpen: () -> Void = {}
 
     private var downPoint: NSPoint?
@@ -55,8 +58,10 @@ final class InteractionNSView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         downPoint = event.locationInWindow
+        onPress(true)
         if event.clickCount == 2 {
             downPoint = nil
+            onPress(false)
             onOpen()
         }
     }
@@ -66,11 +71,13 @@ final class InteractionNSView: NSView {
         let point = event.locationInWindow
         guard hypot(point.x - down.x, point.y - down.y) > 3 else { return }
         downPoint = nil
+        onPress(false)
         actions?.beginDrag(ids, self, event)
     }
 
     override func mouseUp(with event: NSEvent) {
         downPoint = nil
+        onPress(false)
     }
 }
 

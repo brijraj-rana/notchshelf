@@ -18,19 +18,32 @@ enum Snapshot {
         preloadThumbnails(for: files)
 
         let empty = ShelfStore(directory: work.appendingPathComponent("empty"))
-        let shots: [(String, Mode, ShelfStore, Bool)] = [
-            ("collapsed", .ear, store, false),
-            ("drop", .hint, empty, false),
-            ("open", .open, store, false),
-            ("empty", .open, empty, true),
+        let shortcut = Shortcut.standard.parts
+        let shots: [Shot] = [
+            Shot(name: "collapsed", mode: .ear, store: store),
+            Shot(name: "drop", mode: .hint, store: empty),
+            Shot(name: "open", mode: .open, store: store),
+            Shot(name: "empty", mode: .open, store: empty, targeted: true),
+            // Opened from the keyboard: the second tile selected, and the word that follows Command-C.
+            Shot(name: "selected", mode: .open, store: store, selection: 1),
+            Shot(name: "copied", mode: .open, store: store, selection: 1, notice: "Copied"),
+            Shot(name: "shortcut", mode: .recording, store: store, recorder: RecorderState(keys: shortcut)),
+            Shot(name: "shortcut-holding", mode: .recording, store: store, recorder: RecorderState(keys: shortcut, held: ["⌃", "⇧"])),
+            Shot(name: "shortcut-rejected", mode: .recording, store: store,
+                 recorder: RecorderState(keys: shortcut, phase: .rejected("Add Control or Command"))),
+            Shot(name: "shortcut-saved", mode: .recording, store: store, recorder: RecorderState(keys: ["⌃", "⇧", "Space"], phase: .saved)),
         ]
         let out = URL(fileURLWithPath: directory)
         try? fm.createDirectory(at: out, withIntermediateDirectories: true)
 
-        for (name, mode, shelf, targeted) in shots {
+        for shot in shots {
+            let (name, mode, shelf) = (shot.name, shot.mode, shot.store)
             let state = PanelState()
             state.mode = mode
-            state.targeted = targeted
+            state.targeted = shot.targeted
+            state.selection = shot.selection.flatMap { shelf.items.indices.contains($0) ? shelf.items[$0].id : nil }
+            state.notice = shot.notice
+            state.recorder = shot.recorder
             let geo = state.geo
             let body = geo.dims(mode, hasItems: !shelf.items.isEmpty).height
             let height = geo.notchHeight + body + 56
@@ -54,6 +67,16 @@ enum Snapshot {
         }
         try? fm.removeItem(at: work)
         exit(0)
+    }
+
+    private struct Shot {
+        var name: String
+        var mode: Mode
+        var store: ShelfStore
+        var targeted = false
+        var selection: Int?
+        var notice: String?
+        var recorder = RecorderState()
     }
 
     /// ImageRenderer draws once and does not run view tasks, so thumbnails have to be in the cache beforehand.
